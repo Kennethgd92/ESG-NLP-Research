@@ -1,0 +1,324 @@
+# Code for RoBERTa finetune_esg.py
+# Fine-tuning base for EnvRoBERTa / SocRoBERTa / GovRoBERTa
+# Autor: Kenneth Guevara & Jose Juan De León | updated: 2025-08-19
+
+import os
+import json
+import argparse
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from datasets import Dataset
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import accuracy_score, f1_score
+from sklearn.model_selection import StratifiedKFold
+
+import torch
+from transformers import (
+    AutoTokenizer,
+    AutoModelForSequenceClassification,
+    TrainingArguments,
+    Trainer,
+    DataCollatorWithPadding,
+    EarlyStoppingCallback,
+    set_seed,
+)
+
+
+
+#  Utils 
+
+def compute_metrics(eval_pred):
+    preds = np.argmax(eval_pred.predictions, axis=1)
+    acc = accuracy_score(eval_pred.label_ids, preds)
+    f1w = f1_score(eval_pred.label_ids, preds, average="weighted")
+    return {"accuracy": acc, "f1": f1w}
+
+def tokenize_function(batch, tokenizer, text_col, max_length):
+    return tokenizer(batch[text_col], padding="max_length", truncation=True, max_length=max_length)
+
+def init_tracking(args, run_name):
+    wandb_run, mlflow_active = None, False
+    if args.use_wandb:
+        try:
+            import wandb
+            wandb_run = wandb.init(
+                project=args.wandb_project,
+                entity=args.wandb_entity if args.wandb_entity else None,
+                group=args.tag,
+                name=run_name,
+                reinit=True
+            )
+            wandb.log({"fold": run_name})
+        except Exception as e:
+            print(f"[WARN] No se pudo inicializar Weights & Biases: {e}")
+    if args.use_mlflow:
+        try:
+            import mlflow
+            if args.mlflow_tracking_uri:
+                mlflow.set_tracking_uri(args.mlflow_tracking_uri)
+            exp_name = args.mlflow_experiment or f"ESG_CV_{args.tag}"
+            mlflow.set_experiment(exp_name)
+            mlflow.start_run(run_name=run_name)
+            mlflow_active = True
+        except Exception as e:
+            print(f"[WARN] No se pudo inicializar MLflow: {e}")
+    return wandb_run, mlflow_active
+
+def finish_tracking(wandb_run, mlflow_active):
+    if wandb_run is not None:
+        try:
+            import wandb
+            wandb.finish()
+        except Exception:
+            pass
+    if mlflow_active:
+        try:
+            import mlflow
+            mlflow.end_run()
+        except Exception:
+            pass
+
+def save_label_map(label_encoder, out_dir):
+    os.makedirs(out_dir, exist_ok=True)
+    label_map = {int(i): c for i, c in enumerate(label_encoder.classes_)}
+    with open(os.path.join(out_dir, "label_map.json"), "w") as f:
+        json.dump(label_map, f, indent=2)
+    return label_map
+
+def load_or_fit_label_encoder(df_train, df_test, label_col, label_dir, normalize_case=True):
+    """
+    Si existe label_map.json, respeta el orden previo (para reproducibilidad).
+    Si no existe, ajusta con train y aplica a test. Devuelve encoder y clases.
+    """
+    os.makedirs(label_dir, exist_ok=True)
+    label_map_path = os.path.join(label_dir, "label_map.json")
+    if os.path.exists(label_map_path):
+        with open(label_map_path, "r") as f:
+            label_map = json.load(f)
+        classes_sorted = [label_map[str(i)] if str(i) in label_map else label_map[int(i)] for i in range(len(label_map))]
+        le = LabelEncoder()
+        le.classes_ = np.array(classes_sorted)
+    else:
+        le = LabelEncoder()
+        # normalize Capitalization and spaces
+        if normalize_case:
+            df_train[label_col] = df_train[label_col].astype(str).str.capitalize().str.strip()
+            df_test[label_col] = df_test[label_col].astype(str).str.capitalize().str.strip()
+        le.fit(df_train[label_col])
+        save_label_map(le, label_dir)
+    return le
+
+def read_csv_smart(path):
+    # Supports relative/absolute paths and quotes in the path
+    return pd.read_csv(path.strip().strip('"').strip("'"))
+
+# CV Training
+
+def run_stratified_kfold_cv(args):
+    set_seed(args.seed)
+    # 1) load data
+    df_train = read_csv_smart(args.train_path)
+    df_test = read_csv_smart(args.test_path)
+
+    # 2) Label encoder 
+    label_dir = os.path.join(args.save_model_prefix + f"_{args.tag}_artifacts")
+    le = load_or_fit_label_encoder(df_train.copy(), df_test.copy(), args.label_col, label_dir, normalize_case=True)
+
+    # Normalize labels and create columns "label"
+    df_train["label"] = le.transform(df_train[args.label_col].astype(str).str.capitalize().str.strip())
+    df_test["label"] = le.transform(df_test[args.label_col].astype(str).str.capitalize().str.strip())
+    num_labels = len(np.unique(df_train["label"]))
+    label_map = {i: c for i, c in enumerate(le.classes_)}
+
+    # 3) Tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(args.base_model_path, use_fast=True)
+
+    # 4) CV
+    skf = StratifiedKFold(n_splits=args.n_folds, shuffle=True, random_state=args.seed)
+    fold_metrics = []
+    all_fold_dirs = []
+
+    X = df_train[[args.text_col]].reset_index(drop=True)
+    y = df_train["label"].values
+
+    report_to = []
+    if args.use_wandb:
+        report_to.append("wandb")
+    if args.use_mlflow:
+        report_to.append("mlflow")
+    if not report_to:
+        report_to = ["none"]
+
+    for fold_idx, (train_index, val_index) in enumerate(skf.split(X, y), start=1):
+        print(f"\n===== FOLD {fold_idx}/{args.n_folds} =====")
+        run_name = f"{args.tag}-fold{fold_idx}"
+
+        # Tracking
+        wandb_run, mlflow_active = init_tracking(args, run_name)
+        if mlflow_active:
+            try:
+                import mlflow
+                mlflow.log_param("fold", fold_idx)
+            except Exception:
+                pass
+
+        # Splits
+        train_df = df_train.iloc[train_index].reset_index(drop=True)
+        val_df = df_train.iloc[val_index].reset_index(drop=True)
+
+        # Datasets HuggingFace
+        ds_train = Dataset.from_pandas(train_df[[args.text_col, "label"]]).map(
+            lambda x: tokenize_function(x, tokenizer, args.text_col, args.max_length), batched=True
+        )
+        ds_val = Dataset.from_pandas(val_df[[args.text_col, "label"]]).map(
+            lambda x: tokenize_function(x, tokenizer, args.text_col, args.max_length), batched=True
+        )
+        ds_test = Dataset.from_pandas(df_test[[args.text_col, "label"]]).map(
+            lambda x: tokenize_function(x, tokenizer, args.text_col, args.max_length), batched=True
+        )
+
+        # Model
+        model = AutoModelForSequenceClassification.from_pretrained(
+            args.base_model_path, num_labels=num_labels
+        )
+
+        fold_dir = f"{args.save_model_prefix}_{args.tag}_fold{fold_idx}"
+        os.makedirs(fold_dir, exist_ok=True)
+        all_fold_dirs.append(fold_dir)
+
+
+
+        # Training arguments 
+        training_args = TrainingArguments(
+            output_dir=fold_dir,
+            evaluation_strategy="epoch",
+            save_strategy="epoch",
+            learning_rate=args.lr,
+            num_train_epochs=args.epochs,
+            per_device_train_batch_size=args.train_bs,
+            per_device_eval_batch_size=args.eval_bs,
+            weight_decay=args.weight_decay,
+            save_total_limit=args.save_total_limit,
+            logging_steps=args.logging_steps,
+            load_best_model_at_end=True,
+            metric_for_best_model=args.metric_for_best,
+            greater_is_better=True,
+            report_to=report_to,
+            run_name=run_name,
+            seed=args.seed + fold_idx,
+        )
+
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=ds_train,
+            eval_dataset=ds_val,
+            tokenizer=tokenizer,
+            compute_metrics=compute_metrics,
+            data_collator=DataCollatorWithPadding(tokenizer=tokenizer),
+            callbacks=[EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience)],
+        )
+
+        # Train + Eval
+        trainer.train()
+        eval_metrics = trainer.evaluate()
+        test_metrics = trainer.evaluate(ds_test)
+
+        # save metrics every fold
+        fold_metrics.append({
+            "fold": fold_idx,
+            "val_accuracy": float(eval_metrics.get("eval_accuracy", np.nan)),
+            "val_f1": float(eval_metrics.get("eval_f1", np.nan)),
+            "test_accuracy": float(test_metrics.get("eval_accuracy", np.nan)),
+            "test_f1": float(test_metrics.get("eval_f1", np.nan)),
+        })
+
+        # Close tracking
+        finish_tracking(wandb_run, mlflow_active)
+
+    # 5) summary
+    metrics_df = pd.DataFrame(fold_metrics)
+    summary_dir = f"{args.save_model_prefix}_{args.tag}_CV_summary"
+    os.makedirs(summary_dir, exist_ok=True)
+
+    metrics_df.to_csv(os.path.join(summary_dir, f"cv_metrics_{args.tag}.csv"), index=False)
+    with open(os.path.join(summary_dir, f"cv_metrics_{args.tag}.json"), "w") as f:
+        json.dump({
+            "label_map": label_map,
+            "fold_metrics": metrics_df.to_dict('records'),
+            "val_mean": metrics_df[["val_accuracy", "val_f1"]].mean().to_dict(),
+            "test_mean": metrics_df[["test_accuracy", "test_f1"]].mean().to_dict(),
+            "val_std": metrics_df[["val_accuracy", "val_f1"]].std().to_dict(),
+            "test_std": metrics_df[["test_accuracy", "test_f1"]].std().to_dict(),
+        }, f, indent=2)
+
+    # Graphs (matplotlib)
+    plt.figure(figsize=(10, 6))
+    plt.boxplot([metrics_df["val_accuracy"].dropna(), metrics_df["val_f1"].dropna()], labels=["val_accuracy", "val_f1"])
+    plt.title("Distribución métricas de validación (CV)")
+    plt.savefig(os.path.join(summary_dir, "val_metrics_boxplot.png"))
+    plt.close()
+
+    means = metrics_df[["val_accuracy", "val_f1"]].mean()
+    stds = metrics_df[["val_accuracy", "val_f1"]].std()
+    plt.figure(figsize=(8, 5))
+    plt.bar(means.index, means.values, yerr=stds.values, capsize=5)
+    plt.title("Media y desviación estándar (validación)")
+    plt.ylabel("Score")
+    plt.savefig(os.path.join(summary_dir, "val_metrics_barplot.png"))
+    plt.close()
+
+    print(f"\nResumen guardado en: {summary_dir}")
+    print("\nPromedio validación:\n", means.round(4))
+    return metrics_df
+
+
+
+
+# CLI
+
+def build_argparser():
+    p = argparse.ArgumentParser(description="Fine-tuning ESG (Env/Soc/Gov) con CV estratificada")
+    # Data
+    p.add_argument("--train_path", type=str, required=True, help="CSV de entrenamiento")
+    p.add_argument("--test_path", type=str, required=True, help="CSV de test")
+    p.add_argument("--text_col", type=str, default="HEADLINE", help="Columna de texto")
+    p.add_argument("--label_col", type=str, default="sentiment", help="Columna de etiqueta")
+    # Model
+    p.add_argument("--base_model_path", type=str, required=True, help="Ruta del modelo MLM base (HF local o hub)")
+    p.add_argument("--save_model_prefix", type=str, required=True, help="Prefijo para carpetas de salida")
+    
+# Hiperparameter
+    p.add_argument("--epochs", type=int, default=5)
+    p.add_argument("--train_bs", type=int, default=16)
+    p.add_argument("--eval_bs", type=int, default=16)
+    p.add_argument("--lr", type=float, default=2e-5)
+    p.add_argument("--weight_decay", type=float, default=0.01)
+    p.add_argument("--max_length", type=int, default=128)
+    p.add_argument("--n_folds", type=int, default=5)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--early_stopping_patience", type=int, default=3)
+    p.add_argument("--metric_for_best", type=str, default="accuracy", choices=["accuracy", "f1"])
+    p.add_argument("--save_total_limit", type=int, default=2)
+    p.add_argument("--logging_steps", type=int, default=50)
+    
+# Tracking
+    p.add_argument("--use_wandb", action="store_true", help="Activa W&B")
+    p.add_argument("--wandb_project", type=str, default="ESG-FineTune-CV")
+    p.add_argument("--wandb_entity", type=str, default=None)
+    p.add_argument("--use_mlflow", action="store_true", help="Activa MLflow")
+    p.add_argument("--mlflow_tracking_uri", type=str, default=None)
+    p.add_argument("--mlflow_experiment", type=str, default=None)
+   
+# Others
+    p.add_argument("--tag", type=str, default="V01", help="Etiqueta de la corrida (afecta nombres de carpetas)")
+    return p
+
+def main():
+    args = build_argparser().parse_args()
+    run_stratified_kfold_cv(args)
+
+if __name__ == "__main__":
+    main()
